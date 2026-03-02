@@ -17,7 +17,7 @@ on:
 
 jobs:
   review:
-    uses: YOUR_ORG/odoo-review-central/.github/workflows/odoo-review-reusable.yml@main
+    uses: TusharWarlock/odoo-review-central/.github/workflows/odoo-review-reusable.yml@main
     with:
       addons_path:   "."      # change if your addons are in a subdirectory e.g. "addons"
       min_score:     "5.0"    # block if score drops below this
