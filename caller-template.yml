@@ -1,0 +1,28 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  ODOO CODE REVIEW  —  CALLER TEMPLATE
+#
+#  Copy this file to every repo as:
+#    .github/workflows/odoo-review.yml
+#
+#  That is ALL you need in each repo. All logic lives in odoo-review-central.
+#  To change behaviour org-wide, update odoo-review-central only.
+# ════════════════════════════════════════════════════════════════════════════
+
+name: Odoo Code Review
+
+on:
+  push:
+    branches:
+      - "**"          # every branch, every push — exactly what you asked for
+
+jobs:
+  review:
+    uses: YOUR_ORG/odoo-review-central/.github/workflows/odoo-review-reusable.yml@main
+    with:
+      addons_path:   "."      # change if your addons are in a subdirectory e.g. "addons"
+      min_score:     "5.0"    # block if score drops below this
+      block_on_fail: "true"   # set "false" to report only, never block
+    permissions:
+      contents:      read
+      pull-requests: write    # needed to post PR comments
+      statuses:      write    # needed to set commit status ✅/🚫

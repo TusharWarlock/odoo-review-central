@@ -1,0 +1,28 @@
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║   ODOO CODE REVIEW — CALLER WORKFLOW                                    ║
+# ║                                                                          ║
+# ║   Place this file in EACH repo that needs code review:                  ║
+# ║     .github/workflows/odoo-review.yml                                   ║
+# ║                                                                          ║
+# ║   This is all you need — 5 lines. The actual logic lives in the        ║
+# ║   central repo and is maintained in one place.                          ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+name: Odoo Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main, master, develop]
+
+jobs:
+  review:
+    uses: YOUR_ORG/odoo-review-central/.github/workflows/odoo-review-reusable.yml@main
+    with:
+      addons_path: "."          # folder containing your Odoo modules
+      min_score: "5.0"          # block merge if score <= this
+      post_pr_comment: true     # post full report as PR comment
+      block_on_fail: true       # fail the check if score too low
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}   # optional AI summary

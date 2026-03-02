@@ -1,0 +1,377 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  ODOO CODE REVIEW  —  REUSABLE WORKFLOW
+#  Stored in:  your-org/odoo-review-central/.github/workflows/odoo-review-reusable.yml
+#
+#  Every repo calls this with 4 lines (see caller-template.yml).
+#  All logic lives here — update once, all repos get it automatically.
+#
+#  Runner strategy:
+#    1. Tries self-hosted runner first  (label: self-hosted)
+#    2. Falls back to GitHub-hosted     (ubuntu-latest)
+#  No external API calls — 100% local execution.
+# ════════════════════════════════════════════════════════════════════════════
+
+name: Odoo Code Review (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      addons_path:
+        description: "Path to addons directory relative to repo root (default: .)"
+        required: false
+        default: "."
+        type: string
+      min_score:
+        description: "Minimum score to pass (0.0–10.0, default 5.0)"
+        required: false
+        default: "5.0"
+        type: string
+      block_on_fail:
+        description: "Fail the workflow (block merge) if score is below min_score"
+        required: false
+        default: "true"
+        type: string
+
+jobs:
+  # ── Try self-hosted runner first ────────────────────────────────────────────
+  review-self-hosted:
+    name: "🔍 Odoo Review (self-hosted)"
+    runs-on: self-hosted
+    continue-on-error: true        # if no self-hosted runner, fall through
+    outputs:
+      completed: ${{ steps.done.outputs.completed }}
+      score:     ${{ steps.result.outputs.score }}
+      errors:    ${{ steps.result.outputs.errors }}
+      warnings:  ${{ steps.result.outputs.warnings }}
+      passed:    ${{ steps.result.outputs.passed }}
+      report:    ${{ steps.result.outputs.report }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify Python available
+        id: pycheck
+        run: python3 --version
+
+      - name: Download review script
+        run: |
+          curl -sSfL \
+            "https://raw.githubusercontent.com/${{ github.repository_owner }}/odoo-review-central/main/odoo_code_review.py" \
+            -o odoo_code_review.py
+          echo "✅ odoo_code_review.py downloaded"
+
+      - name: Label PR — review running
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await _ensureLabels(github, context);
+            await _setReviewLabel(github, context, 'review: running');
+
+      - name: Run Odoo code review
+        id: run
+        run: |
+          python3 odoo_code_review.py "${{ inputs.addons_path }}" \
+            --min-score "${{ inputs.min_score }}" \
+            --output-json /tmp/review_result.json \
+            2>&1 | tee /tmp/review_output.txt
+          echo "raw_exit=$?" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Parse results
+        id: result
+        run: |
+          python3 - << 'PYEOF'
+          import json, os
+
+          result_file = "/tmp/review_result.json"
+          output_file = "/tmp/review_output.txt"
+
+          if os.path.exists(result_file):
+              d      = json.load(open(result_file))
+              score  = d.get("avg_score", 0.0)
+              errors = d.get("total_errors", 0)
+              warns  = d.get("total_warnings", 0)
+              passed = d.get("passed", False)
+          else:
+              score, errors, warns, passed = 0.0, 0, 0, False
+
+          report = open(output_file).read() if os.path.exists(output_file) else ""
+          # Trim to 6000 chars for GitHub output size limits
+          if len(report) > 6000:
+              report = report[-6000:]
+
+          env_file = os.environ["GITHUB_OUTPUT"]
+          with open(env_file, "a") as f:
+              f.write(f"score={score}\n")
+              f.write(f"errors={errors}\n")
+              f.write(f"warnings={warns}\n")
+              f.write(f"passed={passed}\n")
+              # encode newlines for multi-line output
+              safe = report.replace("%", "%25").replace("\n", "%0A").replace("\r", "%0D")
+              f.write(f"report={safe}\n")
+          PYEOF
+
+      - name: Mark self-hosted run complete
+        id: done
+        run: echo "completed=true" >> $GITHUB_OUTPUT
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            ${{ inputs.block_on_fail == 'true' && '' || '// block_on_fail=false' }}
+            await _postReviewComment(github, context, {
+              score:    "${{ steps.result.outputs.score }}",
+              errors:   "${{ steps.result.outputs.errors }}",
+              warnings: "${{ steps.result.outputs.warnings }}",
+              passed:   "${{ steps.result.outputs.passed }}" === "True",
+              minScore: "${{ inputs.min_score }}",
+              report:   decodeURIComponent("${{ steps.result.outputs.report }}"),
+              runner:   "self-hosted",
+            });
+
+      - name: Set commit status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await _setCommitStatus(github, context, {
+              passed:  "${{ steps.result.outputs.passed }}" === "True",
+              score:   "${{ steps.result.outputs.score }}",
+              runId:   context.runId,
+            });
+
+      - name: Update PR label
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const passed = "${{ steps.result.outputs.passed }}" === "True";
+            await _setReviewLabel(github, context, passed ? 'review: passed' : 'review: failed');
+
+      - name: Enforce score gate
+        if: inputs.block_on_fail == 'true'
+        run: |
+          PASSED="${{ steps.result.outputs.passed }}"
+          SCORE="${{ steps.result.outputs.score }}"
+          if [ "$PASSED" != "True" ]; then
+            echo "🚫 Score $SCORE/10 is below minimum ${{ inputs.min_score }}/10 — blocking."
+            exit 1
+          fi
+          echo "✅ Score $SCORE/10 — passed."
+
+  # ── Fallback: GitHub-hosted runner ──────────────────────────────────────────
+  review-github-hosted:
+    name: "🔍 Odoo Review (github-hosted fallback)"
+    runs-on: ubuntu-latest
+    needs: review-self-hosted
+    # Only run if self-hosted job did not complete successfully
+    if: needs.review-self-hosted.outputs.completed != 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download review script
+        run: |
+          curl -sSfL \
+            "https://raw.githubusercontent.com/${{ github.repository_owner }}/odoo-review-central/main/odoo_code_review.py" \
+            -o odoo_code_review.py
+
+      - name: Label PR — review running
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await _ensureLabels(github, context);
+            await _setReviewLabel(github, context, 'review: running');
+
+      - name: Run Odoo code review
+        id: run
+        run: |
+          python3 odoo_code_review.py "${{ inputs.addons_path }}" \
+            --min-score "${{ inputs.min_score }}" \
+            --output-json /tmp/review_result.json \
+            2>&1 | tee /tmp/review_output.txt
+        continue-on-error: true
+
+      - name: Parse results
+        id: result
+        run: |
+          python3 - << 'PYEOF'
+          import json, os
+          result_file = "/tmp/review_result.json"
+          output_file = "/tmp/review_output.txt"
+          if os.path.exists(result_file):
+              d      = json.load(open(result_file))
+              score  = d.get("avg_score", 0.0)
+              errors = d.get("total_errors", 0)
+              warns  = d.get("total_warnings", 0)
+              passed = d.get("passed", False)
+          else:
+              score, errors, warns, passed = 0.0, 0, 0, False
+          report = open(output_file).read() if os.path.exists(output_file) else ""
+          if len(report) > 6000:
+              report = report[-6000:]
+          env_file = os.environ["GITHUB_OUTPUT"]
+          with open(env_file, "a") as f:
+              f.write(f"score={score}\n")
+              f.write(f"errors={errors}\n")
+              f.write(f"warnings={warns}\n")
+              f.write(f"passed={passed}\n")
+              safe = report.replace("%", "%25").replace("\n", "%0A").replace("\r", "%0D")
+              f.write(f"report={safe}\n")
+          PYEOF
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await _postReviewComment(github, context, {
+              score:    "${{ steps.result.outputs.score }}",
+              errors:   "${{ steps.result.outputs.errors }}",
+              warnings: "${{ steps.result.outputs.warnings }}",
+              passed:   "${{ steps.result.outputs.passed }}" === "True",
+              minScore: "${{ inputs.min_score }}",
+              report:   decodeURIComponent("${{ steps.result.outputs.report }}"),
+              runner:   "github-hosted",
+            });
+
+      - name: Set commit status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await _setCommitStatus(github, context, {
+              passed:  "${{ steps.result.outputs.passed }}" === "True",
+              score:   "${{ steps.result.outputs.score }}",
+              runId:   context.runId,
+            });
+
+      - name: Update PR label
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const passed = "${{ steps.result.outputs.passed }}" === "True";
+            await _setReviewLabel(github, context, passed ? 'review: passed' : 'review: failed');
+
+      - name: Enforce score gate
+        if: inputs.block_on_fail == 'true'
+        run: |
+          PASSED="${{ steps.result.outputs.passed }}"
+          SCORE="${{ steps.result.outputs.score }}"
+          if [ "$PASSED" != "True" ]; then
+            echo "🚫 Score $SCORE/10 below minimum ${{ inputs.min_score }}/10 — blocking."
+            exit 1
+          fi
+          echo "✅ Score $SCORE/10 — passed."
+
+# ── Shared GitHub Script helpers (injected via env) ──────────────────────────
+# These functions are reused across both jobs via github-script
+env:
+  GH_SCRIPTS: |
+    async function _ensureLabels(github, context) {
+      const defs = [
+        { name: 'review: pending',  color: 'cccccc', description: 'Odoo review queued' },
+        { name: 'review: running',  color: 'e4e669', description: 'Odoo review in progress' },
+        { name: 'review: passed',   color: '0e8a16', description: 'Odoo review passed ✅' },
+        { name: 'review: failed',   color: 'd73a49', description: 'Odoo review failed 🚫' },
+      ];
+      for (const label of defs) {
+        try {
+          await github.rest.issues.createLabel({ owner: context.repo.owner, repo: context.repo.repo, ...label });
+        } catch(e) { /* already exists */ }
+      }
+    }
+
+    async function _setReviewLabel(github, context, labelName) {
+      const { owner, repo } = context.repo;
+      const issue_number = context.issue?.number;
+      if (!issue_number) return;
+      const current = await github.rest.issues.listLabelsOnIssue({ owner, repo, issue_number });
+      for (const l of current.data.filter(l => l.name.startsWith('review:'))) {
+        await github.rest.issues.removeLabel({ owner, repo, issue_number, name: l.name });
+      }
+      await github.rest.issues.addLabels({ owner, repo, issue_number, labels: [labelName] });
+    }
+
+    async function _postReviewComment(github, context, { score, errors, warnings, passed, minScore, report, runner }) {
+      const { owner, repo } = context.repo;
+      const issue_number = context.issue?.number;
+      if (!issue_number) return;
+
+      const s      = parseFloat(score);
+      const filled = Math.round(s);
+      const bar    = '█'.repeat(filled) + '░'.repeat(10 - filled);
+      let grade, icon;
+      if      (s >= 9) { grade = 'Excellent'; icon = '✅'; }
+      else if (s >= 7) { grade = 'Good';      icon = '🟢'; }
+      else if (s >= 5) { grade = 'Fair';      icon = '🟡'; }
+      else if (s >= 3) { grade = 'Poor';      icon = '🟠'; }
+      else             { grade = 'Critical';  icon = '🔴'; }
+
+      const statusIcon = passed ? '✅' : '🚫';
+      const statusText = passed
+        ? `Passed — score above minimum ${minScore}/10`
+        : `**Blocked** — score ${score}/10 is below minimum ${minScore}/10`;
+
+      const safeReport = report.length > 4000 ? '…(truncated)\n' + report.slice(-4000) : report;
+
+      const body = [
+        `<!-- odoo-review-bot -->`,
+        `## 🔍 Odoo Code Review`,
+        ``,
+        `| | |`,
+        `|---|---|`,
+        `| **Score**    | \`${bar}\` **${score} / 10** |`,
+        `| **Grade**    | ${icon} ${grade} |`,
+        `| **Errors**   | 🔴 ${errors} must-fix |`,
+        `| **Warnings** | 🟡 ${warnings} should-fix |`,
+        `| **Status**   | ${statusIcon} ${statusText} |`,
+        `| **Runner**   | \`${runner}\` |`,
+        ``,
+        `<details>`,
+        `<summary>📋 Full Report (click to expand)</summary>`,
+        ``,
+        `\`\`\``,
+        safeReport,
+        `\`\`\``,
+        `</details>`,
+        ``,
+        `---`,
+        `*[odoo-review-central](https://github.com/${owner}/odoo-review-central) · no external APIs · ${new Date().toISOString().split('T')[0]}*`,
+      ].join('\n');
+
+      // Update existing comment or create new one
+      const comments = await github.rest.issues.listComments({ owner, repo, issue_number });
+      const existing = comments.data.find(c => c.body.includes('<!-- odoo-review-bot -->'));
+      if (existing) {
+        await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+      } else {
+        await github.rest.issues.createComment({ owner, repo, issue_number, body });
+      }
+    }
+
+    async function _setCommitStatus(github, context, { passed, score, runId }) {
+      await github.rest.repos.createCommitStatus({
+        owner:       context.repo.owner,
+        repo:        context.repo.repo,
+        sha:         context.sha,
+        state:       passed ? 'success' : 'failure',
+        description: `Odoo Review: ${score}/10 ${passed ? '✅ Passed' : '🚫 Failed'}`,
+        context:     'Odoo Code Review',
+        target_url:  `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${runId}`,
+      });
+    }

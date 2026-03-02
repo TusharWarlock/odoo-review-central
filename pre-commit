@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║          ODOO CODE REVIEW — GIT PRE-COMMIT HOOK                        ║
+# ║                                                                          ║
+# ║  Runs automatically before every `git commit`.                          ║
+# ║  Blocks the commit if the code quality score is <= 5.0 / 10.           ║
+# ║                                                                          ║
+# ║  Install:  bash install_hooks.sh                                        ║
+# ║  Skip once (emergency): git commit --no-verify                          ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+set -e
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+# Path to odoo_code_review.py — edit this if you moved the script
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REVIEW_SCRIPT="${ODOO_REVIEW_SCRIPT:-$(dirname "$SCRIPT_DIR")/odoo_code_review.py}"
+
+# Minimum score to allow commit (0.0 – 10.0)
+MIN_SCORE="${ODOO_MIN_SCORE:-5.0}"
+
+# Python executable
+PYTHON="${ODOO_PYTHON:-python3}"
+
+# ── Checks ────────────────────────────────────────────────────────────────────
+if [ ! -f "$REVIEW_SCRIPT" ]; then
+    echo ""
+    echo "  ⚠️   odoo_code_review.py not found at: $REVIEW_SCRIPT"
+    echo "  Set the ODOO_REVIEW_SCRIPT env variable to its location."
+    echo "  Skipping code review — commit allowed."
+    echo ""
+    exit 0
+fi
+
+if ! command -v "$PYTHON" &>/dev/null; then
+    echo ""
+    echo "  ⚠️   Python not found: $PYTHON"
+    echo "  Set ODOO_PYTHON env variable. Skipping review — commit allowed."
+    echo ""
+    exit 0
+fi
+
+# ── Find the addons/module root from the git repo root ────────────────────────
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+SCAN_PATH="$GIT_ROOT"
+
+# If repo root itself is a single module, scan it directly
+if [ -f "$GIT_ROOT/__manifest__.py" ]; then
+    SCAN_PATH="$GIT_ROOT"
+fi
+
+echo ""
+echo "  ═══════════════════════════════════════════════════════════════════"
+echo "  🔍  ODOO PRE-COMMIT CODE REVIEW"
+echo "  ═══════════════════════════════════════════════════════════════════"
+echo "  Minimum score to commit : ${MIN_SCORE} / 10"
+echo "  Scanning                : $SCAN_PATH"
+echo ""
+
+# ── Run the review ────────────────────────────────────────────────────────────
+# --hook flag enables score-based blocking inside the Python script
+"$PYTHON" "$REVIEW_SCRIPT" "$SCAN_PATH" --hook
+
+REVIEW_EXIT=$?
+
+if [ $REVIEW_EXIT -eq 0 ]; then
+    echo ""
+    echo "  ✅  Code review passed — commit allowed."
+    echo ""
+    exit 0
+else
+    echo ""
+    echo "  ═══════════════════════════════════════════════════════════════════"
+    echo "  🚫  COMMIT BLOCKED by Odoo code review."
+    echo "  Fix the issues shown above, then run: git add && git commit"
+    echo ""
+    echo "  To skip this check in an emergency: git commit --no-verify"
+    echo "  ═══════════════════════════════════════════════════════════════════"
+    echo ""
+    exit 1
+fi
